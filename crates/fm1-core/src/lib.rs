@@ -427,6 +427,32 @@ impl Cpu {
         }
     }
 
+    /// FM1AUv3: allocate the native cache eagerly so callers can surface a
+    /// MAP_JIT denial instead of silently running the interpreter.
+    pub fn try_enable_native_jit(&mut self) -> bool {
+        #[cfg(native_jit)]
+        {
+            if self.jit.is_none() {
+                self.jit = jit::Jit::new(self.profile).map(|mut j| {
+                    j.stops = self.stop_checks;
+                    Box::new(j)
+                });
+            }
+            self.jit_on = self.jit.is_some();
+            self.jit_on
+        }
+        #[cfg(not(native_jit))]
+        { false }
+    }
+
+    /// FM1AUv3: reports actual cache ownership, not just the requested flag.
+    pub fn native_jit_ready(&self) -> bool {
+        #[cfg(native_jit)]
+        { self.jit_on && self.jit.is_some() }
+        #[cfg(not(native_jit))]
+        { false }
+    }
+
     /// Would an interrupt of priority `prio` be taken now? Only between
     /// whole constructs: not inside a rep block, a predicated `if {}` or a
     /// dual-issue pair, whose state lives in the core rather than on the

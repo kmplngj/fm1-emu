@@ -157,11 +157,52 @@ pub struct CodeCache {
     used: usize,
 }
 
+// FM1AUv3: Hardened Runtime permits one MAP_JIT region per process. Retain one
+// bounded virtual arena and lease disjoint 64 MiB caches to CPU instances. The
+// mutex protects leases only; compiled execution and code writes do not lock.
+// Pages become resident as code is emitted. Drop releases a lease for reloads.
+#[cfg(target_os = "macos")]
+const MAC_SLOT_BYTES: usize = 64 << 20;
+#[cfg(target_os = "macos")]
+struct MacArena { base: usize, used: u16 }
+#[cfg(target_os = "macos")]
+static MAC_ARENA: std::sync::Mutex<Option<MacArena>> = std::sync::Mutex::new(None);
+
+#[cfg(target_os = "macos")]
+fn mac_cache(size: usize) -> Option<*mut u8> {
+    if size > MAC_SLOT_BYTES { return None; }
+    let mut state = MAC_ARENA.lock().ok()?;
+    if state.is_none() {
+        let p = unsafe { mmap(std::ptr::null_mut(), MAC_SLOT_BYTES * 16, 7, MAP_FLAGS, -1, 0) };
+        if p as isize == -1 || p.is_null() { return None; }
+        *state = Some(MacArena { base: p as usize, used: 0 });
+    }
+    let arena = state.as_mut()?;
+    let slot = (!arena.used).trailing_zeros();
+    if slot >= 16 { return None; }
+    arena.used |= 1 << slot;
+    Some((arena.base + slot as usize * MAC_SLOT_BYTES) as *mut u8)
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for CodeCache {
+    fn drop(&mut self) {
+        if let Ok(mut state) = MAC_ARENA.lock() {
+            if let Some(arena) = state.as_mut() {
+                let slot = (self.base as usize - arena.base) / MAC_SLOT_BYTES;
+                arena.used &= !(1 << slot);
+            }
+        }
+    }
+}
+
 impl CodeCache {
     pub fn new(size: usize) -> Option<CodeCache> {
         // SAFETY: anonymous mapping chosen by the OS; failure is checked.
-        #[cfg(not(windows))]
+        #[cfg(all(not(windows), not(target_os = "macos")))]
         let p = unsafe { mmap(std::ptr::null_mut(), size, 7, MAP_FLAGS, -1, 0) };
+        #[cfg(target_os = "macos")]
+        let p = mac_cache(size)? as *mut c_void;
         // SAFETY: fresh pages chosen by the OS; failure (null) is checked.
         #[cfg(windows)]
         let p = unsafe { VirtualAlloc(std::ptr::null_mut(), size, MEM_COMMIT_RESERVE, PAGE_EXECUTE_READWRITE) };
